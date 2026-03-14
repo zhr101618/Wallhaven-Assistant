@@ -34,6 +34,12 @@ def get_verify_ssl():
     """获取是否验证 SSL 的标志"""
     return not getattr(sys, 'frozen', False)
 
+def get_base_path():
+    """获取程序的基础路径，兼容脚本和 EXE 模式"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
 def set_wallpaper(path):
     """设置 Windows 壁纸"""
     # SPI_SETDESKWALLPAPER = 20
@@ -289,9 +295,10 @@ class WallpaperApp(QMainWindow):
         
         self.api_key = ""
         self.proxy = DEFAULT_PROXY
+        self.base_path = get_base_path()
         
         # 加载配置
-        self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        self.config_file = os.path.join(self.base_path, "config.json")
         self.load_config()
         
         # 移除启动时的强制登录弹窗，直接以现有配置（或游客模式）启动
@@ -741,19 +748,30 @@ class WallpaperApp(QMainWindow):
             try:
                 proxies = {"http": self.proxy, "https": self.proxy}
                 verify_ssl = get_verify_ssl()
-                # 使用 large 预览图替代 small，解决模糊问题
-                r = requests.get(data['thumbs']['large'], proxies=proxies, timeout=10, verify=verify_ssl)
+                # 恢复使用 small 预览图以提升加载速度，降低卡顿感
+                r = requests.get(data['thumbs']['small'], proxies=proxies, timeout=10, verify=verify_ssl)
+                
+                if r.status_code != 200:
+                    raise Exception("HTTP 请求失败")
+
                 qimg = QImage.fromData(r.content)
                 pixmap = QPixmap.fromImage(qimg).scaled(QSize(*THUMBNAIL_SIZE), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                # 线程安全更新 Pixmap
-                QMetaObject.invokeMethod(img_label, "setPixmap", 
-                                       Qt.ConnectionType.QueuedConnection, 
-                                       Q_ARG(QPixmap, pixmap))
-            except Exception as e:
-                # 线程安全更新文本
-                QMetaObject.invokeMethod(img_label, "setText", 
-                                       Qt.ConnectionType.QueuedConnection, 
-                                       Q_ARG(str, "预览失败"))
+                
+                # 线程安全更新 Pixmap，捕获对象可能已删除的异常
+                try:
+                    QMetaObject.invokeMethod(img_label, "setPixmap", 
+                                           Qt.ConnectionType.QueuedConnection, 
+                                           Q_ARG(QPixmap, pixmap))
+                except RuntimeError:
+                    pass
+            except Exception:
+                try:
+                    # 线程安全更新文本
+                    QMetaObject.invokeMethod(img_label, "setText", 
+                                           Qt.ConnectionType.QueuedConnection, 
+                                           Q_ARG(str, "预览失败"))
+                except RuntimeError:
+                    pass
         
         # 按钮
         btn_layout = QHBoxLayout()
@@ -993,7 +1011,7 @@ class WallpaperApp(QMainWindow):
 
     def load_config(self):
         """加载配置文件"""
-        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Wallhaven_Downloads")
+        default_dir = os.path.join(self.base_path, "Wallhaven_Downloads")
         self.save_dir = default_dir
         
         if os.path.exists(self.config_file):
