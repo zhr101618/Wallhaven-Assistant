@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QGridLayout, QFileDialog, QMessageBox, QCheckBox, QFrame, QDialog,
                              QProgressBar, QMenu, QWidgetAction)
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QIntValidator, QColor, QPainter
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, pyqtSlot, QMetaObject, Q_ARG
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, pyqtSlot, QMetaObject, Q_ARG, QRunnable, QThreadPool
 from io import BytesIO
 from PIL import Image
 
@@ -108,10 +108,9 @@ class PreviewDialog(QDialog):
         
         def fetch():
             try:
-                proxies = {"http": self.parent.proxy, "https": self.parent.proxy}
                 verify_ssl = get_verify_ssl()
-                # 直接拉取原图 path，确保极致清晰度
-                r = requests.get(data['path'], proxies=proxies, timeout=30, verify=verify_ssl)
+                # 使用全局 Session 复用连接
+                r = self.parent.session.get(data['path'], timeout=30, verify=verify_ssl)
                 qimg = QImage.fromData(r.content)
                 self.current_pixmap = QPixmap.fromImage(qimg)
                 # 使用 QMetaObject.invokeMethod 线程安全地更新 UI
@@ -119,7 +118,7 @@ class PreviewDialog(QDialog):
             except Exception as e:
                 # 如果原图加载失败，尝试回退到 large 预览图
                 try:
-                    r = requests.get(data['thumbs']['large'], proxies=proxies, timeout=15, verify=verify_ssl)
+                    r = self.parent.session.get(data['thumbs']['large'], timeout=15, verify=verify_ssl)
                     qimg = QImage.fromData(r.content)
                     self.current_pixmap = QPixmap.fromImage(qimg)
                     QMetaObject.invokeMethod(self, "update_image_display", Qt.ConnectionType.QueuedConnection)
@@ -182,20 +181,19 @@ class ImageLoaderThread(QThread):
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
 
-    def __init__(self, params, proxies):
+    def __init__(self, params, session):
         super().__init__()
         self.params = params
-        self.proxies = proxies
+        self.session = session
 
     def run(self):
         try:
-            # 这里的获取请求也改用 self.session
             verify_ssl = get_verify_ssl()
-            resp = requests.get("https://wallhaven.cc/api/v1/search", 
-                                params=self.params, 
-                                proxies=self.proxies, 
-                                timeout=30, 
-                                verify=verify_ssl)
+            # 使用全局 Session 复用连接
+            resp = self.session.get("https://wallhaven.cc/api/v1/search", 
+                                    params=self.params, 
+                                    timeout=30, 
+                                    verify=verify_ssl)
             data = resp.json()
             if resp.status_code == 200:
                 self.finished.emit(data.get('data', []))
@@ -204,10 +202,46 @@ class ImageLoaderThread(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+class ThumbnailRunnable(QRunnable):
+    """异步加载缩略图的任务"""
+    def __init__(self, data, img_label, session):
+        super().__init__()
+        self.data = data
+        self.img_label = img_label
+        self.session = session
+
+    def run(self):
+        try:
+            verify_ssl = get_verify_ssl()
+            # 使用全局 Session 复用连接
+            r = self.session.get(self.data['thumbs']['small'], timeout=10, verify=verify_ssl)
+            
+            if r.status_code != 200:
+                raise Exception("HTTP 请求失败")
+
+            qimg = QImage.fromData(r.content)
+            pixmap = QPixmap.fromImage(qimg).scaled(QSize(*THUMBNAIL_SIZE), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            
+            # 线程安全更新 Pixmap
+            try:
+                QMetaObject.invokeMethod(self.img_label, "setPixmap", 
+                                       Qt.ConnectionType.QueuedConnection, 
+                                       Q_ARG(QPixmap, pixmap))
+            except RuntimeError:
+                pass
+        except Exception:
+            try:
+                QMetaObject.invokeMethod(self.img_label, "setText", 
+                                       Qt.ConnectionType.QueuedConnection, 
+                                       Q_ARG(str, "预览失败"))
+            except RuntimeError:
+                pass
+
 class LoginDialog(QDialog):
     """登录对话框，用于输入 API Key"""
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.parent = parent
         self.setWindowTitle("登录 Wallhaven")
         self.setFixedSize(400, 230) # 稍微增加高度以容纳更多提示
         self.api_key = ""
@@ -274,7 +308,8 @@ class LoginDialog(QDialog):
             params = {'apikey': key}
             # 同样修复这里的验证问题
             verify_ssl = get_verify_ssl()
-            r = requests.get("https://wallhaven.cc/api/v1/settings", params=params, timeout=10, verify=verify_ssl)
+            # 使用全局 Session 复用连接
+            r = self.parent.session.get("https://wallhaven.cc/api/v1/settings", params=params, timeout=10, verify=verify_ssl)
             if r.status_code == 200:
                 self.api_key = key
                 self.accept()
@@ -297,6 +332,14 @@ class WallpaperApp(QMainWindow):
         self.proxy = DEFAULT_PROXY
         self.base_path = get_base_path()
         
+        # 创建全局 Session 以复用连接
+        self.session = requests.Session()
+        self.update_proxy()
+        
+        # 创建线程池控制并发
+        self.thread_pool = QThreadPool()
+        self.thread_pool.setMaxThreadCount(6) # 限制同时加载 6 张图，防止代理拥堵
+        
         # 加载配置
         self.config_file = os.path.join(self.base_path, "config.json")
         self.load_config()
@@ -310,6 +353,7 @@ class WallpaperApp(QMainWindow):
         self.checkboxes = {} # 存储当前显示的复选框 {img_id: checkbox_widget}
         self.selected_color = None # 存储选中的颜色
         self.is_loading = False # 正在加载标志
+        self.infinite_scroll = False # 无限滚动模式标志
         
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
@@ -319,6 +363,11 @@ class WallpaperApp(QMainWindow):
         self.progress_signal.connect(self.progress_bar.setValue)
         # 确保信号连接完成后再进行初始搜索，以防 network 线程在连接前发出信号
         self.new_search()
+
+    def update_proxy(self):
+        """更新 Session 和代理设置"""
+        self.session.proxies = {"http": self.proxy, "https": self.proxy}
+        self.session.verify = get_verify_ssl()
 
     def init_ui(self):
         central_widget = QWidget()
@@ -341,6 +390,7 @@ class WallpaperApp(QMainWindow):
 
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["Date Added", "Relevance", "Random", "Views", "Favorites", "Toplist", "Hot"])
+        self.sort_combo.setFixedWidth(100)
         row1.addWidget(QLabel("排序:"))
         row1.addWidget(self.sort_combo)
 
@@ -348,6 +398,7 @@ class WallpaperApp(QMainWindow):
         self.range_combo = QComboBox()
         self.range_combo.addItems(["1d", "1w", "1M", "3M", "6M", "1y"])
         self.range_combo.setCurrentText("1M")
+        self.range_combo.setFixedWidth(60)
         row1.addWidget(self.range_label)
         row1.addWidget(self.range_combo)
         
@@ -355,12 +406,14 @@ class WallpaperApp(QMainWindow):
         row1.addWidget(QLabel("分辨率:"))
         self.res_combo = QComboBox()
         self.res_combo.addItems(["Any", "1920x1080", "2560x1440", "3840x2160", "4096x2304", "5120x2880"])
+        self.res_combo.setFixedWidth(100)
         row1.addWidget(self.res_combo)
 
         # 比例
         row1.addWidget(QLabel("比例:"))
         self.ratio_combo = QComboBox()
         self.ratio_combo.addItems(["Any", "16x9", "16x10", "4x3", "21x9", "9x16", "10x16"])
+        self.ratio_combo.setFixedWidth(80)
         row1.addWidget(self.ratio_combo)
 
         search_btn = QPushButton("搜索/刷新")
@@ -437,6 +490,13 @@ class WallpaperApp(QMainWindow):
         self.color_btn.clicked.connect(self.show_color_menu)
         row2.addWidget(self.color_btn)
 
+        row2.addSpacing(30)
+
+        # 加载模式
+        self.mode_toggle = QCheckBox("无限加载")
+        self.mode_toggle.stateChanged.connect(self.toggle_mode)
+        row2.addWidget(self.mode_toggle)
+
         row2.addStretch(1) # 关键：让所有控件向左靠拢
         top_bar_layout.addLayout(row2)
         main_layout.addLayout(top_bar_layout)
@@ -453,6 +513,9 @@ class WallpaperApp(QMainWindow):
         self.grid_layout = QGridLayout(self.grid_widget)
         self.scroll_area.setWidget(self.grid_widget)
         main_layout.addWidget(self.scroll_area)
+
+        # 监听滚动条，实现无限滚动
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self.on_scroll)
 
         # ---- 底部状态栏/翻页 ----
         bottom_bar = QHBoxLayout()
@@ -498,7 +561,9 @@ class WallpaperApp(QMainWindow):
         bottom_bar.addStretch(1)
 
         # 右侧翻页区
-        right_ctrl = QHBoxLayout()
+        self.pagination_widget = QWidget()
+        right_ctrl = QHBoxLayout(self.pagination_widget)
+        right_ctrl.setContentsMargins(0, 0, 0, 0)
         self.prev_btn_ctrl = QPushButton("上一页")
         self.prev_btn_ctrl.clicked.connect(self.prev_page)
         self.next_btn_ctrl = QPushButton("下一页")
@@ -518,7 +583,7 @@ class WallpaperApp(QMainWindow):
         
         right_ctrl.addWidget(self.next_btn_ctrl)
         
-        bottom_bar.addLayout(right_ctrl)
+        bottom_bar.addWidget(self.pagination_widget)
 
         main_layout.addLayout(bottom_bar)
 
@@ -527,6 +592,23 @@ class WallpaperApp(QMainWindow):
         is_toplist = text == "Toplist"
         self.range_label.setVisible(is_toplist)
         self.range_combo.setVisible(is_toplist)
+
+    def toggle_mode(self, state):
+        """切换加载模式"""
+        self.infinite_scroll = (state == 2)
+        self.pagination_widget.setVisible(not self.infinite_scroll)
+        self.new_search()
+
+    def on_scroll(self, value):
+        """滚动条事件处理"""
+        if not self.infinite_scroll or self.is_loading:
+            return
+        
+        # 触底检测 (留出 100 像素余量)
+        scrollbar = self.scroll_area.verticalScrollBar()
+        if value > scrollbar.maximum() - 100:
+            self.page += 1
+            self.refresh_images(append=True)
 
     def show_color_menu(self):
         """显示仿官网的颜色选择面板"""
@@ -648,9 +730,7 @@ class WallpaperApp(QMainWindow):
         if self.selected_color:
             params['colors'] = self.selected_color
         
-        proxies = {"http": self.proxy, "https": self.proxy}
-        
-        self.loader = ImageLoaderThread(params, proxies)
+        self.loader = ImageLoaderThread(params, self.session)
         self.loader.finished.connect(lambda imgs: self.on_images_loaded(imgs, append))
         self.loader.error.connect(self.on_load_error)
         self.loader.start()
@@ -743,35 +823,9 @@ class WallpaperApp(QMainWindow):
         img_label.clicked.connect(self.open_preview)
         layout.addWidget(img_label)
 
-        # 异步加载缩略图
-        def load_thumb():
-            try:
-                proxies = {"http": self.proxy, "https": self.proxy}
-                verify_ssl = get_verify_ssl()
-                # 恢复使用 small 预览图以提升加载速度，降低卡顿感
-                r = requests.get(data['thumbs']['small'], proxies=proxies, timeout=10, verify=verify_ssl)
-                
-                if r.status_code != 200:
-                    raise Exception("HTTP 请求失败")
-
-                qimg = QImage.fromData(r.content)
-                pixmap = QPixmap.fromImage(qimg).scaled(QSize(*THUMBNAIL_SIZE), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                
-                # 线程安全更新 Pixmap，捕获对象可能已删除的异常
-                try:
-                    QMetaObject.invokeMethod(img_label, "setPixmap", 
-                                           Qt.ConnectionType.QueuedConnection, 
-                                           Q_ARG(QPixmap, pixmap))
-                except RuntimeError:
-                    pass
-            except Exception:
-                try:
-                    # 线程安全更新文本
-                    QMetaObject.invokeMethod(img_label, "setText", 
-                                           Qt.ConnectionType.QueuedConnection, 
-                                           Q_ARG(str, "预览失败"))
-                except RuntimeError:
-                    pass
+        # 使用线程池异步加载缩略图
+        runnable = ThumbnailRunnable(data, img_label, self.session)
+        self.thread_pool.start(runnable)
         
         # 按钮
         btn_layout = QHBoxLayout()
@@ -783,10 +837,6 @@ class WallpaperApp(QMainWindow):
         btn_layout.addWidget(dl_btn)
         btn_layout.addWidget(set_btn)
         layout.addLayout(btn_layout)
-
-        # 启动缩略图加载
-        from threading import Thread
-        Thread(target=load_thumb).start()
 
         return card
 
@@ -898,7 +948,8 @@ class WallpaperApp(QMainWindow):
 
             self.status_signal.emit(f"正在下载: {img_id}...", 0)
             verify_ssl = get_verify_ssl()
-            r = requests.get(url, proxies=proxies, timeout=60, verify=verify_ssl)
+            # 使用全局 Session 复用连接
+            r = self.session.get(url, timeout=60, verify=verify_ssl)
             if r.status_code == 200:
                 with open(path, 'wb') as f:
                     f.write(r.content)
