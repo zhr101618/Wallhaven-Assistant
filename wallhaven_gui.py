@@ -19,14 +19,14 @@ import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLineEdit, QPushButton, QComboBox, QScrollArea, QLabel, 
                              QGridLayout, QFileDialog, QMessageBox, QCheckBox, QFrame, QDialog,
-                             QProgressBar, QMenu, QWidgetAction)
+                             QProgressBar, QMenu, QWidgetAction, QInputDialog)
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QIntValidator, QColor, QPainter
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, pyqtSlot, QMetaObject, Q_ARG, QRunnable, QThreadPool
 from io import BytesIO
 from PIL import Image
 
 # ================= 配置常量 =================
-DEFAULT_PROXY = "socks5h://127.0.0.1:15235"
+DEFAULT_PROXY = "" # 默认为空，表示尝试自动识别系统代理
 THUMBNAIL_SIZE = (250, 180) # 增大缩略图尺寸
 # ===========================================
 
@@ -366,7 +366,17 @@ class WallpaperApp(QMainWindow):
 
     def update_proxy(self):
         """更新 Session 和代理设置"""
-        self.session.proxies = {"http": self.proxy, "https": self.proxy}
+        if self.proxy:
+            # 如果提供了具体的代理字符串，则手动设置
+            # 支持格式如: socks5h://127.0.0.1:7890 或 127.0.0.1:7890
+            proxy_url = self.proxy
+            if "://" not in proxy_url:
+                proxy_url = f"socks5h://{proxy_url}"
+            self.session.proxies = {"http": proxy_url, "https": proxy_url}
+        else:
+            # 否则清除手动代理，让 requests 自动使用系统代理
+            self.session.proxies = {}
+        
         self.session.verify = get_verify_ssl()
 
     def init_ui(self):
@@ -378,7 +388,7 @@ class WallpaperApp(QMainWindow):
         top_bar_layout = QVBoxLayout()
         top_bar_layout.setSpacing(10)
         
-        # 第一行: 搜索、排序、范围、分辨率、比例 + 用户信息
+        # 第一行: 搜索、排序、范围、分辨率、比例 + 代理设置 + 用户信息
         row1 = QHBoxLayout()
         row1.setContentsMargins(0, 0, 0, 0)
         
@@ -422,6 +432,29 @@ class WallpaperApp(QMainWindow):
         row1.addWidget(search_btn)
         
         row1.addStretch(1)
+
+        # 网络设置图标
+        proxy_btn = QPushButton("🌐")
+        proxy_btn.setFixedSize(28, 28)
+        proxy_btn.setToolTip("网络代理设置")
+        proxy_btn.clicked.connect(self.set_proxy)
+        proxy_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #333; 
+                color: #888; 
+                border: 1px solid #444; 
+                border-radius: 14px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #444;
+                color: #eee;
+                border: 1px solid #666;
+            }
+        """)
+        row1.addWidget(proxy_btn)
+        
+        row1.addSpacing(5)
 
         # 右上角用户栏 (仅保留一个暗色调的可点击人头图标)
         self.user_btn = QPushButton("👤" if self.api_key else "🔑")
@@ -1054,6 +1087,18 @@ class WallpaperApp(QMainWindow):
             self.save_config()
             self.status_signal.emit(f"保存目录已更改: {self.save_dir}", 3000)
 
+    def set_proxy(self):
+        """弹出对话框设置代理"""
+        text, ok = QInputDialog.getText(self, "网络设置", 
+                                        "请输入代理地址 (留空则自动使用系统代理):\n例如: 127.0.0.1:7890", 
+                                        QLineEdit.EchoMode.Normal, self.proxy)
+        if ok:
+            self.proxy = text.strip()
+            self.save_config()
+            self.update_proxy()
+            self.status_signal.emit(f"代理设置已更新: {self.proxy if self.proxy else '自动(系统)'}", 3000)
+            self.new_search()
+
     def open_save_dir(self):
         """打开下载目录文件夹"""
         if not os.path.exists(self.save_dir):
@@ -1064,6 +1109,7 @@ class WallpaperApp(QMainWindow):
         """加载配置文件"""
         default_dir = os.path.join(self.base_path, "Wallhaven_Downloads")
         self.save_dir = default_dir
+        self.proxy = DEFAULT_PROXY
         
         if os.path.exists(self.config_file):
             try:
@@ -1071,6 +1117,7 @@ class WallpaperApp(QMainWindow):
                     config = json.load(f)
                     self.save_dir = config.get("save_dir", default_dir)
                     self.api_key = config.get("api_key", "") # 加载 API Key
+                    self.proxy = config.get("proxy", DEFAULT_PROXY) # 加载自定义代理
             except Exception as e:
                 print(f"加载配置失败: {e}")
         
@@ -1080,6 +1127,9 @@ class WallpaperApp(QMainWindow):
                 os.makedirs(self.save_dir)
             except:
                 pass
+        
+        # 应用加载后的代理
+        self.update_proxy()
 
     def save_config(self):
         """保存配置到文件"""
@@ -1087,7 +1137,8 @@ class WallpaperApp(QMainWindow):
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump({
                     "save_dir": self.save_dir,
-                    "api_key": self.api_key # 保存 API Key
+                    "api_key": self.api_key,
+                    "proxy": self.proxy
                 }, f, ensure_ascii=False, indent=4)
         except Exception as e:
             print(f"保存配置失败: {e}")
